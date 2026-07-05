@@ -1,0 +1,523 @@
+substitutions:
+  device_name: "plane-radar"
+  friendly_name: "Plane Radar"
+  default_lat: "59.325"     # Stockholm Sweden,change or set live via HA/web UI
+  default_lon: "18.05"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  variant: esp32c3
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: "asdasdasdasdasdasdasdasdasd"   # use the one created by your framework
+
+ota:
+  platform: esphome
+
+mqtt:
+  id: mqtt_client
+  client_id: ${device_name}
+  broker: !secret mqtt_broker
+  port: !secret mqtt_port
+  username: !secret mqtt_user
+  password: !secret mqtt_password
+  discovery: false
+  topic_prefix: 'wifi2mqtt/${device_name}'
+  discovery_prefix: 'nonexistent_discovery_topic'
+  log_topic:
+    topic: null
+    level: NONE
+
+# --- Wi-Fi using credentials from ESPHome's secrets.yaml (Home Assistant add-on) ---
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+web_server:
+  version: 3
+
+http_request:
+  useragent: esphome-plane-radar/1.0
+  timeout: 10s
+
+time:
+  - platform: sntp
+    id: sntp_time
+
+# ---------------------------------------------------------------------
+# Persisted settings (replaces the "planeradar" NVS namespace).
+# Editable from Home Assistant, or from the built-in web_server dashboard
+# at http://plane-radar.local, or straight from the ESPHome API.
+# ---------------------------------------------------------------------
+number:
+  - platform: template
+    name: "Home Latitude"
+    id: home_lat
+    min_value: -90
+    max_value: 90
+    step: 0.0001
+    initial_value: ${default_lat}
+    optimistic: true
+    restore_value: true
+    entity_category: config
+
+  - platform: template
+    name: "Home Longitude"
+    id: home_lon
+    min_value: -180
+    max_value: 180
+    step: 0.0001
+    initial_value: ${default_lon}
+    optimistic: true
+    restore_value: true
+    entity_category: config
+
+  # Enter the compass heading you are facing (from e.g. the iPhone Compass
+  # app) and the firmware rotates the radar so that direction is at the top
+  # of the display. Rotation applied on screen = (360 - facing) mod 360.
+  # Example: facing 240 (SW) -> screen rotation 120.
+  - platform: template
+    name: "Facing Direction"
+    id: facing_direction
+    min_value: 0
+    max_value: 359
+    step: 1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    unit_of_measurement: "°"
+
+select:
+  - platform: template
+    name: "Radar Range"
+    id: radar_range
+    options:
+      - "5"
+      - "10"
+      - "15"
+      - "25"
+    initial_option: "10"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+
+  - platform: template
+    name: "Units"
+    id: radar_units
+    options:
+      - "km"
+      - "mi"
+    initial_option: "km"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+
+# In-memory aircraft list, refreshed every poll. Not persisted (no need to be).
+# Stored as parallel arrays of plain types instead of a custom struct, so
+# everything stays in this single yaml with no separate header file.
+globals:
+  - id: ac_callsign
+    type: std::vector<std::string>
+    restore_value: false
+  - id: ac_hex
+    type: std::vector<std::string>
+    restore_value: false
+  - id: ac_registration
+    type: std::vector<std::string>
+    restore_value: false
+  - id: ac_type
+    type: std::vector<std::string>
+    restore_value: false
+  - id: ac_squawk
+    type: std::vector<std::string>
+    restore_value: false
+  - id: ac_lat
+    type: std::vector<double>
+    restore_value: false
+  - id: ac_lon
+    type: std::vector<double>
+    restore_value: false
+  - id: ac_distance_km
+    type: std::vector<double>
+    restore_value: false
+  - id: ac_bearing_deg
+    type: std::vector<double>
+    restore_value: false
+  - id: ac_has_track
+    type: std::vector<bool>
+    restore_value: false
+  - id: ac_track_deg
+    type: std::vector<double>
+    restore_value: false
+  - id: ac_has_altitude
+    type: std::vector<bool>
+    restore_value: false
+  - id: ac_altitude_ft
+    type: std::vector<int>
+    restore_value: false
+  - id: ac_has_speed
+    type: std::vector<bool>
+    restore_value: false
+  - id: ac_speed_kt
+    type: std::vector<double>
+    restore_value: false
+  - id: ac_has_vrate
+    type: std::vector<bool>
+    restore_value: false
+  - id: ac_vrate_fpm
+    type: std::vector<int>
+    restore_value: false
+
+sensor:
+  - platform: template
+    name: "Aircraft Count"
+    id: aircraft_count
+    unit_of_measurement: "aircraft"
+    icon: "mdi:airplane"
+    accuracy_decimals: 0
+
+# ---------------------------------------------------------------------
+# BOOT button: short press cycles range 5 -> 10 -> 15 -> 25 -> 5.
+# Long press (3s) factory-resets local settings (lat/lon/range/facing).
+# Wi-Fi credentials now come from secrets.yaml at compile time, so there's
+# no runtime Wi-Fi credential store left to wipe - factory_reset just
+# clears the persisted number/select values above.
+# ---------------------------------------------------------------------
+button:
+  - platform: factory_reset
+    id: factory_reset_btn
+    name: "Factory Reset"
+    entity_category: config
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO9
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    id: boot_button
+    name: "Boot Button"
+    entity_category: diagnostic
+    filters:
+      - delayed_on: 10ms
+    on_click:
+      # Short click: 50ms - 2.9s -> cycle range
+      - min_length: 50ms
+        max_length: 2900ms
+        then:
+          - lambda: |-
+              std::string cur = id(radar_range).state;
+              std::string next = "5";
+              if (cur == "5") next = "10";
+              else if (cur == "10") next = "15";
+              else if (cur == "15") next = "25";
+              else next = "5";
+              auto call = id(radar_range).make_call();
+              call.set_option(next);
+              call.perform();
+      # Long press: 3s - 10s -> factory reset (mirrors original credential wipe)
+      - min_length: 3000ms
+        max_length: 10000ms
+        then:
+          - button.press: factory_reset_btn
+
+# ---------------------------------------------------------------------
+# Poll adsb.fi every 5s (matches original ~5s cadence) and refresh the list.
+# NOTE: adjust JSON field names below if your response differs -
+# check the "plane radar" logger tag after flashing to see the raw body.
+# ---------------------------------------------------------------------
+interval:
+  - interval: 5s
+    then:
+      - http_request.get:
+          url: !lambda |-
+            char buf[220];
+            int range_km = atoi(id(radar_range).state.c_str());
+            snprintf(buf, sizeof(buf),
+                     "https://opendata.adsb.fi/api/v2/lat/%.4f/lon/%.4f/dist/%d",
+                     (double) id(home_lat).state, (double) id(home_lon).state, range_km);
+            return std::string(buf);
+          capture_response: true
+          max_response_buffer_size: 32kB
+          on_response:
+            then:
+              - lambda: |-
+                  // Local geo-math helpers (kept here instead of a header
+                  // file, since this is the only place that needs them).
+                  auto deg2rad = [](double d) { return d * M_PI / 180.0; };
+                  auto rad2deg = [](double r) { return r * 180.0 / M_PI; };
+                  auto calc_distance_km = [&](double lat1, double lon1, double lat2, double lon2) -> double {
+                    const double R = 6371.0;
+                    double dlat = deg2rad(lat2 - lat1);
+                    double dlon = deg2rad(lon2 - lon1);
+                    double a = sin(dlat / 2) * sin(dlat / 2) +
+                               cos(deg2rad(lat1)) * cos(deg2rad(lat2)) * sin(dlon / 2) * sin(dlon / 2);
+                    double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+                    return R * c;
+                  };
+                  auto calc_bearing_deg = [&](double lat1, double lon1, double lat2, double lon2) -> double {
+                    double phi1 = deg2rad(lat1), phi2 = deg2rad(lat2);
+                    double dlon = deg2rad(lon2 - lon1);
+                    double y = sin(dlon) * cos(phi2);
+                    double x = cos(phi1) * sin(phi2) - sin(phi1) * cos(phi2) * cos(dlon);
+                    double brng = rad2deg(atan2(y, x));
+                    return fmod(brng + 360.0, 360.0);
+                  };
+
+                  id(ac_callsign).clear();
+                  id(ac_hex).clear();
+                  id(ac_registration).clear();
+                  id(ac_type).clear();
+                  id(ac_squawk).clear();
+                  id(ac_lat).clear();
+                  id(ac_lon).clear();
+                  id(ac_distance_km).clear();
+                  id(ac_bearing_deg).clear();
+                  id(ac_has_track).clear();
+                  id(ac_track_deg).clear();
+                  id(ac_has_altitude).clear();
+                  id(ac_altitude_ft).clear();
+                  id(ac_has_speed).clear();
+                  id(ac_speed_kt).clear();
+                  id(ac_has_vrate).clear();
+                  id(ac_vrate_fpm).clear();
+
+                  double hlat = id(home_lat).state;
+                  double hlon = id(home_lon).state;
+
+                  json::parse_json(body, [&](JsonObject root) -> bool {
+                    if (!root["ac"].is<JsonArray>()) {
+                      ESP_LOGW("plane radar", "unexpected response shape, no 'ac' array");
+                      return false;
+                    }
+                    for (JsonObject ac : root["ac"].as<JsonArray>()) {
+                      if (!ac["lat"].is<float>() || !ac["lon"].is<float>()) continue;
+                      double alat = ac["lat"].as<double>();
+                      double alon = ac["lon"].as<double>();
+
+                      std::string hex = ac["hex"].is<const char*>() ? std::string(ac["hex"].as<const char*>()) : std::string("");
+
+                      std::string callsign = ac["flight"].is<const char*>()
+                                                  ? std::string(ac["flight"].as<const char*>())
+                                                  : (hex.empty() ? std::string("?????") : hex);
+                      // trim whitespace adsb.fi pads callsigns with
+                      while (!callsign.empty() && callsign.back() == ' ') callsign.pop_back();
+
+                      id(ac_callsign).push_back(callsign);
+                      id(ac_hex).push_back(hex);
+                      id(ac_registration).push_back(ac["r"].is<const char*>() ? std::string(ac["r"].as<const char*>()) : std::string(""));
+                      id(ac_type).push_back(ac["t"].is<const char*>() ? std::string(ac["t"].as<const char*>()) : std::string(""));
+                      id(ac_squawk).push_back(ac["squawk"].is<const char*>() ? std::string(ac["squawk"].as<const char*>()) : std::string(""));
+                      id(ac_lat).push_back(alat);
+                      id(ac_lon).push_back(alon);
+                      id(ac_distance_km).push_back(calc_distance_km(hlat, hlon, alat, alon));
+                      id(ac_bearing_deg).push_back(calc_bearing_deg(hlat, hlon, alat, alon));
+
+                      if (ac["alt_baro"].is<int>()) {
+                        id(ac_altitude_ft).push_back(ac["alt_baro"].as<int>());
+                        id(ac_has_altitude).push_back(true);
+                      } else {
+                        id(ac_altitude_ft).push_back(0);
+                        id(ac_has_altitude).push_back(false);
+                      }
+
+                      if (ac["track"].is<float>()) {
+                        id(ac_track_deg).push_back(ac["track"].as<double>());
+                        id(ac_has_track).push_back(true);
+                      } else {
+                        id(ac_track_deg).push_back(0);
+                        id(ac_has_track).push_back(false);
+                      }
+
+                      if (ac["gs"].is<float>()) {
+                        id(ac_speed_kt).push_back(ac["gs"].as<double>());
+                        id(ac_has_speed).push_back(true);
+                      } else {
+                        id(ac_speed_kt).push_back(0);
+                        id(ac_has_speed).push_back(false);
+                      }
+
+                      // adsb.fi reports vertical rate as either baro_rate or geom_rate
+                      // depending on what the aircraft's transponder sends.
+                      if (ac["baro_rate"].is<int>()) {
+                        id(ac_vrate_fpm).push_back(ac["baro_rate"].as<int>());
+                        id(ac_has_vrate).push_back(true);
+                      } else if (ac["geom_rate"].is<int>()) {
+                        id(ac_vrate_fpm).push_back(ac["geom_rate"].as<int>());
+                        id(ac_has_vrate).push_back(true);
+                      } else {
+                        id(ac_vrate_fpm).push_back(0);
+                        id(ac_has_vrate).push_back(false);
+                      }
+                    }
+                    return true;
+                  });
+
+                  int n = id(ac_callsign).size();
+                  ESP_LOGD("plane radar", "tracking %d aircraft", n);
+                  id(aircraft_count).publish_state(n);
+
+                  // Publish the full list as one JSON payload. Includes everything
+                  // the API gave us; fields the aircraft's transponder didn't send
+                  // are simply omitted for that aircraft (no destination airport is
+                  // available from ADS-B - "heading_deg" is the closest thing, i.e.
+                  // the direction the aircraft is currently flying).
+                  std::string mqtt_payload = json::build_json([n](JsonObject root) {
+                    root["count"] = n;
+                    JsonArray arr = root["aircraft"].to<JsonArray>();
+                    for (int i = 0; i < n; i++) {
+                      JsonObject o = arr.add<JsonObject>();
+                      o["callsign"] = id(ac_callsign)[i];
+                      if (!id(ac_hex)[i].empty()) o["hex"] = id(ac_hex)[i];
+                      if (!id(ac_registration)[i].empty()) o["registration"] = id(ac_registration)[i];
+                      if (!id(ac_type)[i].empty()) o["type"] = id(ac_type)[i];
+                      if (!id(ac_squawk)[i].empty()) o["squawk"] = id(ac_squawk)[i];
+                      o["lat"] = id(ac_lat)[i];
+                      o["lon"] = id(ac_lon)[i];
+                      o["distance_km"] = id(ac_distance_km)[i];
+                      o["bearing_from_home_deg"] = id(ac_bearing_deg)[i];
+                      if (id(ac_has_track)[i]) o["heading_deg"] = id(ac_track_deg)[i];
+                      if (id(ac_has_altitude)[i]) o["altitude_ft"] = id(ac_altitude_ft)[i];
+                      if (id(ac_has_speed)[i]) o["ground_speed_kt"] = id(ac_speed_kt)[i];
+                      if (id(ac_has_vrate)[i]) o["vertical_rate_fpm"] = id(ac_vrate_fpm)[i];
+                    }
+                  });
+                  id(mqtt_client).publish("wifi2mqtt/${device_name}/aircraft", mqtt_payload, 0, false);
+
+# ---------------------------------------------------------------------
+# Display: SPI wiring matches the original board.
+#   RST -> GPIO0, CS -> GPIO1, DC -> GPIO10, MOSI -> GPIO3, SCLK -> GPIO4
+# ---------------------------------------------------------------------
+spi:
+  clk_pin: GPIO4
+  mosi_pin: GPIO3
+
+color:
+  - id: col_bg
+    hex: 0A1128        # dark blue background
+  - id: col_ring
+    hex: 1E5B3C        # subdued green rings/crosshairs
+  - id: col_text
+    hex: FFFFFF        # white N/S/E/W + labels
+  - id: col_near
+    hex: 39FF6A        # near aircraft - bright green
+  - id: col_mid
+    hex: FFD23F        # mid-range aircraft - amber
+  - id: col_far
+    hex: FF3B3B        # far/rim aircraft - red
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_label
+    size: 12
+  - file: "gfonts://Roboto"
+    id: font_bezel
+    size: 14
+
+display:
+  - platform: mipi_spi
+    model: GC9A01A
+    id: radar_display
+    cs_pin: GPIO1
+    dc_pin: GPIO10
+    reset_pin: GPIO0
+    invert_colors: true      # matches original firmware kDisplayInvert = true
+    color_order: rgb         # matches original firmware kDisplayRgbOrder = true
+    update_interval: 5s
+    lambda: |-
+      const int cx = 120, cy = 120;
+      const int outer_r = 105;
+
+      // Local helper (kept here instead of a header file): converts a
+      // bearing + distance into screen x/y for a radar centered at (cx,cy).
+      auto polar_to_screen = [&](double bearing, double distance_km, double max_range_km,
+                                  int cx, int cy, int px_radius, int &out_x, int &out_y) {
+        double clamped = distance_km > max_range_km ? max_range_km : distance_km;
+        double r_px = (clamped / max_range_km) * px_radius;
+        double theta = (bearing - 90.0) * M_PI / 180.0;  // -90 so 0deg (N) points up
+        out_x = cx + (int) round(r_px * cos(theta));
+        out_y = cy + (int) round(r_px * sin(theta));
+      };
+
+      it.fill(id(col_bg));
+
+      int range_km = atoi(id(radar_range).state.c_str());
+      bool miles = id(radar_units).state == "mi";
+
+      // Rings at 1/4, 1/2, 3/4, full radius (circles are rotation-invariant).
+      for (int i = 1; i <= 4; i++) {
+        it.circle(cx, cy, outer_r * i / 4, id(col_ring));
+      }
+
+      // Screen rotation derived from the direction the user is facing:
+      // rot = (360 - facing) mod 360, so the facing direction ends up at
+      // the top of the display. Facing 240 (SW) -> rot 120.
+      double rot = fmod(360.0 - id(facing_direction).state, 360.0);
+
+      // Crosshairs: draw as two lines through the center at rot and rot+90,
+      // instead of fixed horizontal/vertical, so they turn with the display.
+      int nx, ny, sx, sy, ex, ey, wx, wy;
+      polar_to_screen(fmod(rot + 0.0, 360.0),   outer_r, outer_r, cx, cy, outer_r, nx, ny);
+      polar_to_screen(fmod(rot + 180.0, 360.0), outer_r, outer_r, cx, cy, outer_r, sx, sy);
+      polar_to_screen(fmod(rot + 90.0, 360.0),  outer_r, outer_r, cx, cy, outer_r, ex, ey);
+      polar_to_screen(fmod(rot + 270.0, 360.0), outer_r, outer_r, cx, cy, outer_r, wx, wy);
+      it.line(nx, ny, sx, sy, id(col_ring));
+      it.line(ex, ey, wx, wy, id(col_ring));
+
+      // Bezel labels N/S/E/W, positioned along the rotated cardinal bearings,
+      // pushed slightly past the outer ring so they sit outside it.
+      int lnx, lny, lsx, lsy, lex, ley, lwx, lwy;
+      polar_to_screen(fmod(rot + 0.0, 360.0),   outer_r + 12, outer_r, cx, cy, outer_r, lnx, lny);
+      polar_to_screen(fmod(rot + 180.0, 360.0), outer_r + 12, outer_r, cx, cy, outer_r, lsx, lsy);
+      polar_to_screen(fmod(rot + 90.0, 360.0),  outer_r + 12, outer_r, cx, cy, outer_r, lex, ley);
+      polar_to_screen(fmod(rot + 270.0, 360.0), outer_r + 12, outer_r, cx, cy, outer_r, lwx, lwy);
+      it.print(lnx, lny, id(font_bezel), id(col_text), TextAlign::CENTER, "N");
+      it.print(lsx, lsy, id(font_bezel), id(col_text), TextAlign::CENTER, "S");
+      it.print(lex, ley, id(font_bezel), id(col_text), TextAlign::CENTER, "E");
+      it.print(lwx, lwy, id(font_bezel), id(col_text), TextAlign::CENTER, "W");
+
+      // Range label on the ring-3 (3/4 radius) east spoke, rotated along with everything else.
+      int rlx, rly;
+      polar_to_screen(fmod(rot + 90.0, 360.0), outer_r * 3 / 4, outer_r, cx, cy, outer_r, rlx, rly);
+      char range_label[16];
+      if (miles) {
+        snprintf(range_label, sizeof(range_label), "%.0fmi", range_km * 0.621371);
+      } else {
+        snprintf(range_label, sizeof(range_label), "%dkm", range_km);
+      }
+      it.print(rlx, rly, id(font_label), id(col_text), TextAlign::CENTER, range_label);
+
+      // Plot aircraft. True bearing is unaffected by rotation - we only
+      // rotate where it lands on screen, same as the compass labels above.
+      int n = id(ac_callsign).size();
+      for (int i = 0; i < n; i++) {
+        int x, y;
+        double screen_bearing = fmod(id(ac_bearing_deg)[i] + rot, 360.0);
+        polar_to_screen(screen_bearing, id(ac_distance_km)[i], range_km, cx, cy, outer_r, x, y);
+
+        Color dot_color = id(col_near);
+        double frac = id(ac_distance_km)[i] / range_km;
+        if (frac > 0.66) dot_color = id(col_far);
+        else if (frac > 0.33) dot_color = id(col_mid);
+
+        it.filled_circle(x, y, 3, dot_color);
+
+        std::string label = id(ac_callsign)[i];
+        if (id(ac_has_altitude)[i]) {
+          char alt_buf[12];
+          snprintf(alt_buf, sizeof(alt_buf), " FL%d", id(ac_altitude_ft)[i] / 100);
+          label += alt_buf;
+        }
+        it.print(x, y + 8, id(font_label), id(col_text), TextAlign::TOP_CENTER, label.c_str());
+      }
