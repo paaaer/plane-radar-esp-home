@@ -2,7 +2,7 @@
 
 An [ESPHome](https://esphome.io) port of a desktop ADS-B plane radar: an ESP32-C3 and a 1.28″ round GC9A01 display (240×240) showing live aircraft around your location on a sonar-style radar screen — with native Home Assistant and MQTT integration on top.
 
-Inspired by, and a functional re-implementation of, [MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP32-Plane-Radar), which is a standalone Arduino/PlatformIO firmware. This project reproduces its core behaviour as a single ESPHome YAML file so it can live alongside your other ESPHome devices, be configured from Home Assistant, and publish aircraft data over MQTT.
+Inspired by, and a functional re-implementation of, [MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP32-Plane-Radar), which is a standalone Arduino/PlatformIO firmware. This project reproduces its core behaviour as a single ESPHome YAML file so it can live alongside your other ESPHome devices, be configured from Home Assistant, and publish aircraft data over MQTT. 
 
 ## What it does
 
@@ -45,12 +45,15 @@ All of these survive reboots and can be changed from Home Assistant or the devic
 | Entity | Purpose |
 |---|---|
 | Home Latitude / Home Longitude | Radar center point |
-| Radar Range | 5 / 10 / 15 / 25 km |
+| Radar Range | Slider, any radius 5–100 km |
 | Units | km or mi (range label) |
 | Facing Direction | Display rotation, entered as your compass heading |
 
+### Coverage map
+The device serves its own coverage map at **`http://plane-radar.local/map`** — a [Leaflet](https://leafletjs.com) + OpenStreetMap page embedded in the firmware that shows the radar position with a light-blue circle at the configured coverage radius. It reads the live lat/lon/range from the device's own REST API on load, with a Refresh button to re-sync after changing settings. (The viewing browser needs internet access for the map tiles; the values come from the device itself.) A standalone copy (`radius-map.html`) is included in the repo for use off-network.
+
 ### BOOT button
-- **Short press** — cycle range: 5 → 10 → 15 → 25 → 5 km
+- **Short press** — jump to the next range preset above the current slider value (5 → 10 → 15 → 25 → 50 → 100 → 5 km)
 - **Long press (3–10 s)** — factory reset of the persisted settings above
 
 (Unlike the original, Wi-Fi credentials are compiled in from `secrets.yaml`, so there is no runtime Wi-Fi reset — change networks by editing secrets and re-uploading.)
@@ -110,7 +113,7 @@ Fields an aircraft's transponder didn't send are omitted rather than sent as zer
 - Aircraft data lives in parallel `globals` vectors of plain types, so everything fits in a single YAML file with no external header.
 - Distance uses the haversine formula; bearing uses the standard initial-bearing formula; both are computed on-device from raw lat/lon in the API response.
 - Polar-to-screen projection maps `(bearing, distance)` to display pixels, clamped to the outer ring, with the rotation offset applied at draw time only.
-- The adsb.fi endpoint queried is `https://opendata.adsb.fi/api/v2/lat/{lat}/lon/{lon}/dist/{range}` and the response is parsed with ESPHome's built-in JSON support.
+- The adsb.fi endpoint queried is `https://opendata.adsb.fi/api/v3/lat/{lat}/lon/{lon}/dist/{nm}` (distance converted from km to nautical miles on-device) and the response is parsed with ESPHome's built-in JSON support.
 
 ## Differences from the original
 
