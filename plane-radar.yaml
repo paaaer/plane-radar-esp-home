@@ -105,6 +105,8 @@ select:
       - "10"
       - "15"
       - "25"
+      - "35"
+      - "50"
     initial_option: "10"
     optimistic: true
     restore_value: true
