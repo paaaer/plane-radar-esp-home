@@ -2,16 +2,18 @@
 
 An [ESPHome](https://esphome.io) port of a desktop ADS-B plane radar: an ESP32-C3 and a 1.28″ round GC9A01 display (240×240) showing live aircraft around your location on a sonar-style radar screen — with native Home Assistant and MQTT integration on top.
 
-Inspired by, and a functional re-implementation of, [MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP32-Plane-Radar), which is a standalone Arduino/PlatformIO firmware. This project reproduces its core behaviour as a single ESPHome YAML file so it can live alongside your other ESPHome devices, be configured from Home Assistant, and publish aircraft data over MQTT. 
+Inspired by [MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP32-Plane-Radar), which is a standalone Arduino/PlatformIO firmware. This project is a functional re-implementation as a single ESPHome YAML file so it can live alongside your other ESPHome devices, be configured from Home Assistant, and publish aircraft data over MQTT.
 
 ## What it does
 
-Every 5 seconds the device queries the free [adsb.fi](https://adsb.fi) open data API for aircraft within the configured range of your home coordinates. Each aircraft is converted from latitude/longitude into a distance and compass bearing relative to your location, then plotted on the round display as a colored dot with its callsign and flight level:
+Every 5 seconds the device queries the free [adsb.fi](https://adsb.fi) open data API for aircraft within the configured range of your home coordinates. Each aircraft is converted from latitude/longitude into a distance and compass bearing relative to your location, then plotted on the round display:
 
-- Dark blue background with subdued green range rings and crosshairs
+- Black background with dark green range rings and crosshairs
 - N / S / E / W compass labels on the bezel
 - Range label on the east spoke
-- Dot color indicates distance: green (near) → amber (mid) → red (far)
+- Aircraft shown as red filled triangles pointing along their heading
+- White trajectory lines extending from each triangle, scaled by speed
+- Three-line tag per aircraft: callsign (white), type code (light blue), altitude (yellow)
 
 At the same time, the aircraft list is published to Home Assistant and MQTT (see below).
 
@@ -34,7 +36,7 @@ The display is driven by ESPHome's `mipi_spi` platform (the `ili9xxx` platform i
 ## Features
 
 ### Radar display
-Rings, crosshairs, compass labels, and per-aircraft dots with callsign + flight level, redrawn every 5 seconds.
+Dark green rings, crosshairs, and compass labels on a black background, with aircraft rendered as red triangles and white speed vectors, redrawn every 5 seconds.
 
 ### Facing-direction rotation
 If the device isn't physically pointed north, set the **Facing Direction** entity to the compass heading you're facing (read it off your phone's compass app, e.g. `240` if you're looking southwest). The firmware computes the screen rotation as `(360 − facing) mod 360` and rotates the whole compass rose and every aircraft position so the sky in front of you is at the top of the screen. Aircraft bearings themselves stay true — only the on-screen orientation changes.
@@ -48,9 +50,36 @@ All of these survive reboots and can be changed from Home Assistant or the devic
 | Radar Range | Slider, any radius 5–100 km |
 | Units | km or mi (range label) |
 | Facing Direction | Display rotation, entered as your compass heading |
+| Runway Overlay | On/Off — draws teal runway strips for nearby airports |
+| Outer Radius | How far beyond the ring range to show fringe dots (100–200%, default 133%) |
 
-### Coverage map
-The device serves its own coverage map at **`http://plane-radar.local/map`** — a [Leaflet](https://leafletjs.com) + OpenStreetMap page embedded in the firmware that shows the radar position with a light-blue circle at the configured coverage radius. It reads the live lat/lon/range from the device's own REST API on load, with a Refresh button to re-sync after changing settings. (The viewing browser needs internet access for the map tiles; the values come from the device itself.) A standalone copy (`radius-map.html`) is included in the repo for use off-network.
+### Runway overlay
+Draws runway strips (medium blue) with ICAO labels (lighter blue) for nearby airports, projected onto the radar exactly like aircraft. The YAML ships with Stockholm Arlanda (ESSA) and Uppsala/Ärna (ESCM) pre-filled.
+
+To generate runway data for your own location, run the included `build_airports.py` script:
+
+```bash
+# Uses default location (Uppsala) and 150 km radius
+python3 build_airports.py
+
+# Or specify your own coordinates and radius
+python3 build_airports.py 59.8586 17.6389 200
+```
+
+The script downloads the public-domain [OurAirports](https://ourairports.com) airport and runway CSVs, filters to airports within range that have usable runway threshold coordinates, and outputs a ready-to-paste block to both `airports_block.txt` and the console. Copy-paste it over the clearly marked `REPLACEABLE BLOCK` section in `plane-radar.yaml` (everything between and including the `===` marker lines), then recompile.
+
+Each airport in the block is two lines of C++ (an ICAO label + a flat list of runway endpoint coordinates), with runway identifiers as comments so you can see what you're getting. Remove any airports you don't want — the firmware auto-filters by your live range anyway, so extra airports just cost a few bytes of flash.
+
+### Web interface
+The device hosts a built-in web dashboard at **`http://plane-radar.local`** (or its IP address) where all settings can be viewed and adjusted without Home Assistant. The interface provides sliders for Radar Range, Outer Radius, and Facing Direction, text fields for Home Latitude and Home Longitude, and dropdowns for Units and Runway Overlay. Changes take effect immediately — no reflash needed. The Aircraft Count sensor is also shown live.
+
+<img width="1769" height="667" alt="image" src="https://github.com/user-attachments/assets/716fb4d9-569e-4450-bacc-8c3b769ff110" />
+
+
+### Aircraft display
+Each in-range aircraft renders as a small red filled triangle pointing in its direction of travel, with a white trajectory line extending from the nose tip whose length scales with ground speed (~1 px per 20 knots). The tag label is placed to the side of the aircraft (toward the center of the display to avoid edge clipping) with three lines: callsign (white), aircraft type code (light blue, if known from the transponder), and altitude in feet (yellow). Aircraft without heading data show as plain red dots.
+
+Aircraft beyond the ring range but within the **Outer Radius** percentage appear as small red dots clamped to the edge of the display — the same "fringe dot" behavior as the original firmware. The default 133% matches the original's ratio (ring-3 label sits at ¾ of the outer ring, so the outer ring represents 4/3 of the labeled range).
 
 ### BOOT button
 - **Short press** — jump to the next range preset above the current slider value (5 → 10 → 15 → 25 → 50 → 100 → 5 km)
@@ -122,7 +151,7 @@ Fields an aircraft's transponder didn't send are omitted rather than sent as zer
 | Framework | Arduino / PlatformIO / LovyanGFX | ESPHome (`esp-idf`) |
 | Wi-Fi setup | WiFiManager captive portal | Compiled-in from `secrets.yaml` |
 | Config UI | Custom web portal | Home Assistant + ESPHome web dashboard |
-| Runway overlay | Yes (OurAirports data) | Not implemented |
+| Runway overlay | Yes (full OurAirports database) | Yes (`build_airports.py` generates a pasteable block from OurAirports) |
 | Smooth embedded font | Yes (Noto Sans VLW) | Roboto via `gfonts://` |
 | Home Assistant | — | Native API integration |
 | MQTT aircraft feed | — | Full JSON list every poll |
