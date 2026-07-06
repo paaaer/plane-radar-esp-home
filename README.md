@@ -4,6 +4,8 @@ An [ESPHome](https://esphome.io) port of a desktop ADS-B plane radar: an ESP32-C
 
 Inspired by [MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP32-Plane-Radar), which is a standalone Arduino/PlatformIO firmware. This project is a functional re-implementation as a single ESPHome YAML file so it can live alongside your other ESPHome devices, be configured from Home Assistant, and publish aircraft data over MQTT.
 
+<img width="802" height="659" alt="image" src="https://github.com/user-attachments/assets/1e441e4f-3efd-4fbe-b448-197bf3d1eefa" />
+
 ## What it does
 
 Every 5 seconds the device queries the free [adsb.fi](https://adsb.fi) open data API for aircraft within the configured range of your home coordinates. Each aircraft is converted from latitude/longitude into a distance and compass bearing relative to your location, then plotted on the round display:
