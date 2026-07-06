@@ -7,6 +7,32 @@ substitutions:
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
+  on_boot:
+    priority: 200
+    then:
+      - lambda: |-
+          // ================= AIRPORT DATA — REPLACEABLE BLOCK =================
+          // Each airport: one push_back to rw_icao (its ICAO label) and one
+          // matching push_back to rw_lines holding its runway endpoint coords,
+          // flattened as {lat1,lon1,lat2,lon2, ...} (4 numbers per runway).
+          //
+          // To regenerate for a different location, run build_airports.py and
+          // paste its output over everything between the two === markers.
+          // Coordinates are WGS84 decimal degrees.
+          // ===================================================================
+          id(rw_icao).push_back("ESSA");
+          id(rw_lines).push_back({
+            59.662963, 17.925211, 59.634037, 17.911995,   // 01L/19R
+            59.659453, 17.947006, 59.637547, 17.936997,   // 01R/19L
+            59.651468, 17.950883, 59.648728, 17.906719    // 08/26
+          });
+
+          id(rw_icao).push_back("ESCM");
+          id(rw_lines).push_back({
+            59.905973, 17.599834, 59.888626, 17.577372,   // 03/21
+            59.898395, 17.606398, 59.896203, 17.570803    // 08/26
+          });
+          // =============== END AIRPORT DATA — REPLACEABLE BLOCK ==============
 
 esp32:
   variant: esp32c3
@@ -58,28 +84,6 @@ time:
 # at http://plane-radar.local, or straight from the ESPHome API.
 # ---------------------------------------------------------------------
 number:
-  - platform: template
-    name: "Home Latitude"
-    id: home_lat
-    min_value: -90
-    max_value: 90
-    step: 0.0001
-    initial_value: ${default_lat}
-    optimistic: true
-    restore_value: true
-    entity_category: config
-
-  - platform: template
-    name: "Home Longitude"
-    id: home_lon
-    min_value: -180
-    max_value: 180
-    step: 0.0001
-    initial_value: ${default_lon}
-    optimistic: true
-    restore_value: true
-    entity_category: config
-
   # Enter the compass heading you are facing (from e.g. the iPhone Compass
   # app) and the firmware rotates the radar so that direction is at the top
   # of the display. Rotation applied on screen = (360 - facing) mod 360.
@@ -96,18 +100,69 @@ number:
     entity_category: config
     unit_of_measurement: "°"
 
-select:
+  # Radar range as a slider (renders as a slider in the web dashboard
+  # and Home Assistant). Any whole-km radius from 5 to 100.
   - platform: template
     name: "Radar Range"
     id: radar_range
+    min_value: 5
+    max_value: 100
+    step: 1
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+    mode: slider
+    unit_of_measurement: "km"
+
+  # Outer radius: aircraft beyond the ring range but within this radius
+  # show as red dots clamped to the edge of the display. The original
+  # firmware uses ~133% (ring3 at 3/4 means the outer ring = 4/3 of the
+  # labeled range). Set to 100 to disable fringe dots entirely.
+  - platform: template
+    name: "Outer Radius"
+    id: outer_radius_pct
+    min_value: 100
+    max_value: 200
+    step: 5
+    initial_value: 133
+    optimistic: true
+    restore_value: true
+    mode: slider
+    unit_of_measurement: "%"
+    entity_category: config
+
+# Lat/lon as free-text inputs (easier to type a precise coordinate than
+# to drag a slider). Parsed to double with atof() wherever they're used.
+text:
+  - platform: template
+    name: "Home Latitude"
+    id: home_lat
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ${default_lat}
+    entity_category: config
+
+  - platform: template
+    name: "Home Longitude"
+    id: home_lon
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ${default_lon}
+    entity_category: config
+
+select:
+  # Runway overlay on/off. The airports themselves are chosen at compile time
+  # by build_airports.py (everything within its radius of home); the firmware
+  # then draws whichever of those fall inside your current range slider.
+  - platform: template
+    name: "Runway Overlay"
+    id: runway_overlay
     options:
-      - "5"
-      - "10"
-      - "15"
-      - "25"
-      - "35"
-      - "50"
-    initial_option: "10"
+      - "Off"
+      - "On"
+    initial_option: "On"
     optimistic: true
     restore_value: true
     entity_category: config
@@ -179,6 +234,18 @@ globals:
     type: std::vector<int>
     restore_value: false
 
+  # Runway overlay data. Two parallel vectors keyed by index:
+  #   rw_icao[i]  = ICAO label for airport i
+  #   rw_lines[i] = flat list of runway endpoint coords for airport i,
+  #                 packed as [lat1,lon1,lat2,lon2, lat1,lon1,lat2,lon2, ...]
+  # Populated once in on_boot from the pasteable block below.
+  - id: rw_icao
+    type: std::vector<std::string>
+    restore_value: false
+  - id: rw_lines
+    type: std::vector<std::vector<double>>
+    restore_value: false
+
 sensor:
   - platform: template
     name: "Aircraft Count"
@@ -214,19 +281,22 @@ binary_sensor:
     filters:
       - delayed_on: 10ms
     on_click:
-      # Short click: 50ms - 2.9s -> cycle range
+      # Short click: jump to the next range preset above the current
+      # slider value (5, 10, 15, 25, 50, 100), wrapping back to 5.
+      # Any in-between slider value set from HA/web still works; the
+      # button just snaps to the next preset up from wherever you are.
       - min_length: 50ms
         max_length: 2900ms
         then:
           - lambda: |-
-              std::string cur = id(radar_range).state;
-              std::string next = "5";
-              if (cur == "5") next = "10";
-              else if (cur == "10") next = "15";
-              else if (cur == "15") next = "25";
-              else next = "5";
+              const int presets[] = {5, 10, 15, 25, 50, 100};
+              int cur = (int) id(radar_range).state;
+              int next = presets[0];
+              for (int p : presets) {
+                if (p > cur) { next = p; break; }
+              }
               auto call = id(radar_range).make_call();
-              call.set_option(next);
+              call.set_value(next);
               call.perform();
       # Long press: 3s - 10s -> factory reset (mirrors original credential wipe)
       - min_length: 3000ms
@@ -245,10 +315,14 @@ interval:
       - http_request.get:
           url: !lambda |-
             char buf[220];
-            int range_km = atoi(id(radar_range).state.c_str());
+            int range_km = (int) id(radar_range).state;
+            // Fetch aircraft out to the outer radius so fringe dots appear.
+            int fetch_km = (int)(range_km * id(outer_radius_pct).state / 100.0);
+            // adsb.fi's dist parameter is in NAUTICAL MILES, not km.
+            int dist_nm = (int) ceil(fetch_km / 1.852);
             snprintf(buf, sizeof(buf),
-                     "https://opendata.adsb.fi/api/v2/lat/%.4f/lon/%.4f/dist/%d",
-                     (double) id(home_lat).state, (double) id(home_lon).state, range_km);
+                     "https://opendata.adsb.fi/api/v3/lat/%.4f/lon/%.4f/dist/%d",
+                     atof(id(home_lat).state.c_str()), atof(id(home_lon).state.c_str()), dist_nm);
             return std::string(buf);
           capture_response: true
           max_response_buffer_size: 32kB
@@ -295,15 +369,23 @@ interval:
                   id(ac_has_vrate).clear();
                   id(ac_vrate_fpm).clear();
 
-                  double hlat = id(home_lat).state;
-                  double hlon = id(home_lon).state;
+                  double hlat = atof(id(home_lat).state.c_str());
+                  double hlon = atof(id(home_lon).state.c_str());
 
                   json::parse_json(body, [&](JsonObject root) -> bool {
-                    if (!root["ac"].is<JsonArray>()) {
-                      ESP_LOGW("plane radar", "unexpected response shape, no 'ac' array");
+                    // adsb.fi /api/v2/ wraps the list in "aircraft";
+                    // /api/v3/ uses the ADSBExchange-compatible "ac".
+                    // Accept either so both endpoint versions work.
+                    JsonArray list;
+                    if (root["aircraft"].is<JsonArray>()) {
+                      list = root["aircraft"].as<JsonArray>();
+                    } else if (root["ac"].is<JsonArray>()) {
+                      list = root["ac"].as<JsonArray>();
+                    } else {
+                      ESP_LOGW("plane radar", "unexpected response shape, no 'aircraft' or 'ac' array");
                       return false;
                     }
-                    for (JsonObject ac : root["ac"].as<JsonArray>()) {
+                    for (JsonObject ac : list) {
                       if (!ac["lat"].is<float>() || !ac["lon"].is<float>()) continue;
                       double alat = ac["lat"].as<double>();
                       double alon = ac["lon"].as<double>();
@@ -407,22 +489,32 @@ spi:
 
 color:
   - id: col_bg
-    hex: 0A1128        # dark blue background
+    hex: "000000"      # kColorBackground — black
   - id: col_ring
-    hex: 1E5B3C        # subdued green rings/crosshairs
+    hex: "006500"      # kColorGrid — dark green
   - id: col_text
-    hex: FFFFFF        # white N/S/E/W + labels
-  - id: col_near
-    hex: 39FF6A        # near aircraft - bright green
-  - id: col_mid
-    hex: FFD23F        # mid-range aircraft - amber
-  - id: col_far
-    hex: FF3B3B        # far/rim aircraft - red
+    hex: FFFFFF        # kColorLabel — white (callsign + N/S/E/W)
+  - id: col_ac
+    hex: FF0000        # kColorAircraft — RED (original swaps R/B for BGR panel;
+                       # ESPHome's color_order:rgb handles that, so we use true red)
+  - id: col_track
+    hex: FFFFFF        # kColorTrackVector — white
+  - id: col_ac_type
+    hex: 5ABEFF        # kColorTagType — light blue
+  - id: col_ac_alt
+    hex: FFFF00        # kColorTagAltitude — yellow
+  - id: col_runway
+    hex: 4AAAFF        # kColorRunway — medium blue
+  - id: col_rwy_label
+    hex: 7BBEFF        # kColorRunwayLabel — lighter blue
 
 font:
   - file: "gfonts://Roboto"
     id: font_label
     size: 12
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 10
   - file: "gfonts://Roboto"
     id: font_bezel
     size: 14
@@ -435,7 +527,9 @@ display:
     dc_pin: GPIO10
     reset_pin: GPIO0
     invert_colors: true      # matches original firmware kDisplayInvert = true
-    color_order: rgb         # matches original firmware kDisplayRgbOrder = true
+    color_order: bgr         # GC9A01 panel is natively BGR; the original firmware
+                             # sets rgb_order=true but then manually swaps R/B for
+                             # the aircraft color to compensate — proving it's BGR.
     update_interval: 5s
     lambda: |-
       const int cx = 120, cy = 120;
@@ -454,8 +548,8 @@ display:
 
       it.fill(id(col_bg));
 
-      int range_km = atoi(id(radar_range).state.c_str());
-      bool miles = id(radar_units).state == "mi";
+      int range_km = (int) id(radar_range).state;
+      bool miles = id(radar_units).current_option() == "mi";
 
       // Rings at 1/4, 1/2, 3/4, full radius (circles are rotation-invariant).
       for (int i = 1; i <= 4; i++) {
@@ -500,26 +594,163 @@ display:
       }
       it.print(rlx, rly, id(font_label), id(col_text), TextAlign::CENTER, range_label);
 
-      // Plot aircraft. True bearing is unaffected by rotation - we only
-      // rotate where it lands on screen, same as the compass labels above.
-      int n = id(ac_callsign).size();
-      for (int i = 0; i < n; i++) {
-        int x, y;
-        double screen_bearing = fmod(id(ac_bearing_deg)[i] + rot, 360.0);
-        polar_to_screen(screen_bearing, id(ac_distance_km)[i], range_km, cx, cy, outer_r, x, y);
+      // ----- Runway overlay (drawn under the aircraft dots) -----
+      if (id(runway_overlay).state == "On") {
+        double hlat = atof(id(home_lat).state.c_str());
+        double hlon = atof(id(home_lon).state.c_str());
 
-        Color dot_color = id(col_near);
-        double frac = id(ac_distance_km)[i] / range_km;
-        if (frac > 0.66) dot_color = id(col_far);
-        else if (frac > 0.33) dot_color = id(col_mid);
+        // Local great-circle helpers (same math as the fetch lambda).
+        auto d2r = [](double d) { return d * M_PI / 180.0; };
+        auto r2d = [](double r) { return r * 180.0 / M_PI; };
+        auto dist_km = [&](double la1, double lo1, double la2, double lo2) -> double {
+          const double R = 6371.0;
+          double dla = d2r(la2 - la1), dlo = d2r(lo2 - lo1);
+          double a = sin(dla/2)*sin(dla/2) + cos(d2r(la1))*cos(d2r(la2))*sin(dlo/2)*sin(dlo/2);
+          return R * 2 * atan2(sqrt(a), sqrt(1-a));
+        };
+        auto brng = [&](double la1, double lo1, double la2, double lo2) -> double {
+          double p1 = d2r(la1), p2 = d2r(la2), dlo = d2r(lo2 - lo1);
+          double y = sin(dlo)*cos(p2);
+          double x = cos(p1)*sin(p2) - sin(p1)*cos(p2)*cos(dlo);
+          return fmod(r2d(atan2(y, x)) + 360.0, 360.0);
+        };
 
-        it.filled_circle(x, y, 3, dot_color);
+        for (size_t ai = 0; ai < id(rw_icao).size(); ai++) {
+          auto &coords = id(rw_lines)[ai];
+          bool any_on_screen = false;
+          int lbl_x = 0, lbl_y = 0;
 
-        std::string label = id(ac_callsign)[i];
-        if (id(ac_has_altitude)[i]) {
-          char alt_buf[12];
-          snprintf(alt_buf, sizeof(alt_buf), " FL%d", id(ac_altitude_ft)[i] / 100);
-          label += alt_buf;
+          // Each runway is 4 consecutive doubles: lat1,lon1,lat2,lon2.
+          for (size_t k = 0; k + 3 < coords.size(); k += 4) {
+            double la1 = coords[k], lo1 = coords[k+1];
+            double la2 = coords[k+2], lo2 = coords[k+3];
+
+            double d1 = dist_km(hlat, hlon, la1, lo1);
+            double b1 = fmod(brng(hlat, hlon, la1, lo1) + rot, 360.0);
+            double d2 = dist_km(hlat, hlon, la2, lo2);
+            double b2 = fmod(brng(hlat, hlon, la2, lo2) + rot, 360.0);
+
+            // Skip runways entirely outside the current display range.
+            if (d1 > range_km && d2 > range_km) continue;
+
+            int x1, y1, x2, y2;
+            polar_to_screen(b1, d1, range_km, cx, cy, outer_r, x1, y1);
+            polar_to_screen(b2, d2, range_km, cx, cy, outer_r, x2, y2);
+            it.line(x1, y1, x2, y2, id(col_runway));
+
+            if (!any_on_screen) {
+              lbl_x = (x1 + x2) / 2;
+              lbl_y = (y1 + y2) / 2;
+              any_on_screen = true;
+            }
+          }
+
+          // One ICAO label per airport, near its first drawn runway.
+          if (any_on_screen) {
+            it.print(lbl_x, lbl_y - 10, id(font_label), id(col_rwy_label),
+                     TextAlign::BOTTOM_CENTER, id(rw_icao)[ai].c_str());
+          }
         }
-        it.print(x, y + 8, id(font_label), id(col_text), TextAlign::TOP_CENTER, label.c_str());
+      }
+
+      // Plot aircraft with directional triangles, trajectory lines, and fringe dots.
+      int n = id(ac_callsign).size();
+      double outer_km = range_km * id(outer_radius_pct).state / 100.0;
+
+      for (int i = 0; i < n; i++) {
+        double dist = id(ac_distance_km)[i];
+        double screen_bearing = fmod(id(ac_bearing_deg)[i] + rot, 360.0);
+        bool in_range = dist <= range_km;
+        bool in_fringe = !in_range && dist <= outer_km;
+
+        if (!in_range && !in_fringe) continue;
+
+        int x, y;
+        if (in_fringe) {
+          // Clamp to the outer ring edge — red dot only, no labels.
+          polar_to_screen(screen_bearing, (double)range_km, range_km, cx, cy, outer_r, x, y);
+          it.filled_circle(x, y, 2, id(col_ac));
+          continue;
+        }
+
+        // In-range aircraft: full rendering.
+        polar_to_screen(screen_bearing, dist, range_km, cx, cy, outer_r, x, y);
+
+        // The original uses nose_deg (heading) for the triangle direction and
+        // track_deg (ground track) for the speed vector. Since adsb.fi only
+        // gives us "track" (ground track), we use that for both — visually
+        // identical except in strong crosswind.
+        double heading_screen = id(ac_has_track)[i]
+                                    ? fmod(id(ac_track_deg)[i] + rot, 360.0)
+                                    : screen_bearing;
+
+        if (id(ac_has_track)[i]) {
+          // Filled triangle: tip points along heading, tail opens behind.
+          double h_rad = (heading_screen - 90.0) * M_PI / 180.0;
+          const int nose = 5;   // nose length from center
+          const int tail = 3;   // tail length behind center
+          const int wing = 3;   // half-width of tail
+
+          // Tip (nose)
+          int tx = x + (int)(nose * cos(h_rad));
+          int ty = y + (int)(nose * sin(h_rad));
+          // Base center (behind)
+          int bx = x - (int)(tail * cos(h_rad));
+          int by = y - (int)(tail * sin(h_rad));
+          // Wing points (perpendicular to heading)
+          double perp = h_rad + M_PI / 2.0;
+          int lx = bx + (int)(wing * cos(perp));
+          int ly = by + (int)(wing * sin(perp));
+          int rx = bx - (int)(wing * cos(perp));
+          int ry = by - (int)(wing * sin(perp));
+
+          it.filled_triangle(tx, ty, lx, ly, rx, ry, id(col_ac));
+
+          // Speed vector line from the nose tip outward along track direction.
+          // Length proportional to ground speed: ~1px per 20 kt, capped at 25px.
+          if (id(ac_has_speed)[i]) {
+            int trail_len = (int)(id(ac_speed_kt)[i] / 20.0);
+            if (trail_len > 25) trail_len = 25;
+            if (trail_len > 2) {
+              int ex = tx + (int)(trail_len * cos(h_rad));
+              int ey = ty + (int)(trail_len * sin(h_rad));
+              it.line(tx, ty, ex, ey, id(col_track));
+            }
+          }
+        } else {
+          // No heading info: plain dot.
+          it.filled_circle(x, y, 3, id(col_ac));
+        }
+
+        // Tag label block: placed to the left or right of the aircraft
+        // symbol (toward center, to avoid edge clipping), matching the
+        // original's drawAircraftTag() layout.
+        int tag_x;
+        auto align = TextAlign::TOP_LEFT;
+        if (x < cx) {
+          // Aircraft on the left half: tag to the right.
+          tag_x = x + 8;
+          align = TextAlign::TOP_LEFT;
+        } else {
+          // Aircraft on the right half: tag to the left.
+          tag_x = x - 8;
+          align = TextAlign::TOP_RIGHT;
+        }
+        int ly = y - 15;   // vertically centered around the symbol
+
+        it.print(tag_x, ly, id(font_label), id(col_text), align,
+                 id(ac_callsign)[i].c_str());
+        ly += 12;
+
+        if (!id(ac_type)[i].empty()) {
+          it.print(tag_x, ly, id(font_small), id(col_ac_type), align,
+                   id(ac_type)[i].c_str());
+          ly += 10;
+        }
+
+        if (id(ac_has_altitude)[i]) {
+          char alt_buf[16];
+          snprintf(alt_buf, sizeof(alt_buf), "%d ft", id(ac_altitude_ft)[i]);
+          it.print(tag_x, ly, id(font_small), id(col_ac_alt), align, alt_buf);
+        }
       }
