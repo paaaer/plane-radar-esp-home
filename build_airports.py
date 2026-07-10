@@ -30,11 +30,12 @@ import io
 import math
 import sys
 import urllib.request
+import ssl
 from pathlib import Path
 
 # --- Defaults: your home location and how far out to keep airports ----------
-HOME_LAT = 59.8586      # Uppsala
-HOME_LON = 17.6389
+HOME_LAT = 53.743      # Quickbornerheide
+HOME_LON = 9.953
 FILTER_RADIUS_KM = 150  # keep airports within this radius of home
 
 # Which OurAirports "type" values to include. The original keeps only
@@ -55,8 +56,11 @@ RUNWAYS_URL = (
 
 
 def fetch_csv(url: str) -> list[dict[str, str]]:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
     print(f"downloading {url.rsplit('/', 1)[-1]} ...")
-    with urllib.request.urlopen(url, timeout=120) as resp:
+    with urllib.request.urlopen(url, timeout=120, context= ctx) as resp:
         text = resp.read().decode("utf-8")
     return list(csv.DictReader(io.StringIO(text)))
 
